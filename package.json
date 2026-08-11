@@ -18,8 +18,9 @@
     "build": "tsc && node -e \"require('fs').chmodSync('dist/index.js', 0o755)\"",
     "watch": "tsc --watch",
     "start": "node dist/index.js",
+    "start:http": "node dist/index.js --http",
     "smoke": "node test/smoke.mjs",
-    "test": "node test/smoke.mjs && node test/integration.mjs",
+    "test": "node test/smoke.mjs && node test/integration.mjs && node test/http.mjs",
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js",
     "prepare": "npm run build"
   },
