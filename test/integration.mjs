@@ -167,6 +167,61 @@ const POWER_GRID = [
   },
 ];
 
+const ROUTE_GEOMETRY = [
+  [2.2945, 48.8584],
+  [2.31, 48.859],
+  [2.3376, 48.8606],
+];
+
+const FUEL_ALONG = [
+  { type: "node", id: 80, lat: 48.8585, lon: 2.295, tags: { amenity: "fuel", name: "Station A" } },
+  { type: "node", id: 81, lat: 48.8605, lon: 2.337, tags: { amenity: "fuel", name: "Station B" } },
+];
+
+const TRACE_WAYS = [
+  {
+    type: "way",
+    id: 70001,
+    nodes: [9001, 9002],
+    geometry: [
+      { lat: 48.86, lon: 2.3 },
+      { lat: 48.87, lon: 2.31 },
+    ],
+    tags: { power: "line", voltage: "225000", ref: "LIGNE-X", operator: "RTE" },
+  },
+  {
+    type: "way",
+    id: 70002,
+    nodes: [9002, 9003],
+    geometry: [
+      { lat: 48.87, lon: 2.31 },
+      { lat: 48.88, lon: 2.32 },
+    ],
+    tags: { power: "line", voltage: "225000", ref: "LIGNE-X", operator: "RTE" },
+  },
+  {
+    // Different voltage: must NOT be followed by the trace.
+    type: "way",
+    id: 70003,
+    nodes: [9003, 9004],
+    geometry: [
+      { lat: 48.88, lon: 2.32 },
+      { lat: 48.89, lon: 2.33 },
+    ],
+    tags: { power: "line", voltage: "90000" },
+  },
+];
+
+const TRACE_SUBSTATION = [
+  {
+    type: "node",
+    id: 90,
+    lat: 48.8805,
+    lon: 2.3205,
+    tags: { power: "substation", name: "Poste Arrivée" },
+  },
+];
+
 const POWER_PLANTS = [
   {
     type: "way",
@@ -201,6 +256,14 @@ const POWER_PLANTS = [
 const overpassQueries = [];
 
 function overpassFixture(query) {
+  if (query.includes("out count")) {
+    return [{ type: "count", id: 0, tags: { nodes: "12", ways: "0", relations: "0", total: "12" } }];
+  }
+  if (query.includes("rel(bw)")) return [];
+  if (query.includes("way(70001)")) return [TRACE_WAYS[0]];
+  if (query.includes("way(bn)")) return TRACE_WAYS;
+  if (query.includes('"power"="substation"](around')) return TRACE_SUBSTATION;
+  if (query.includes("(around:")) return FUEL_ALONG;
   if (query.includes('"amenity"="charging_station"')) return EV_STATIONS;
   if (query.includes('"amenity"="parking"')) return PARKING;
   if (query.includes('"amenity"="school"')) return SCHOOLS;
@@ -214,6 +277,8 @@ function overpassFixture(query) {
   }
   if (query.includes("bus_stop")) return TRANSIT_STOPS;
   if (query.includes("^(plant|generator)$") || query.includes("^(plant)$")) return POWER_PLANTS;
+  if (query.includes('"power"~"^(line|minor_line|cable)$"')) return [POWER_GRID[0]];
+  if (query.includes('"power"~"^(substation|transformer)$"')) return [POWER_GRID[1]];
   if (query.includes('"power"')) return POWER_GRID;
   return GENERIC_POIS;
 }
@@ -232,8 +297,23 @@ const mock = createServer((req, res) => {
           display_name: "Tour Eiffel, Paris, France",
           type: "attraction",
           importance: 0.9,
+          boundingbox: ["48.81", "48.9", "2.25", "2.42"],
         },
       ]),
+    );
+    return;
+  }
+
+  if (url.pathname.startsWith("/table/v1/")) {
+    const sources = (url.searchParams.get("sources") ?? "").split(";").filter(Boolean);
+    const destinations = (url.searchParams.get("destinations") ?? "").split(";").filter(Boolean);
+    res.setHeader("content-type", "application/json");
+    res.end(
+      JSON.stringify({
+        code: "Ok",
+        durations: sources.map((_, i) => destinations.map((_, j) => (i + 1) * 600 + j * 60)),
+        distances: sources.map((_, i) => destinations.map((_, j) => (i + 1) * 5000 + j * 500)),
+      }),
     );
     return;
   }
@@ -258,7 +338,7 @@ const mock = createServer((req, res) => {
           {
             distance: 5000,
             duration: 600,
-            geometry: { type: "LineString", coordinates: [] },
+            geometry: { type: "LineString", coordinates: ROUTE_GEOMETRY },
             legs: [
               {
                 steps: [
@@ -547,6 +627,137 @@ const bigOnly = await callToolJson("find_power_plants", { ...at, radius: 20000, 
 assert(
   bigOnly.count === 1 && bigOnly.facilities[0].name === "Centrale Solaire Test",
   "find_power_plants filters by minimum output",
+);
+
+// 17. get_travel_time_matrix
+const matrix = await callToolJson("get_travel_time_matrix", {
+  origins: ["Tour Eiffel", { latitude: 48.87, longitude: 2.35 }],
+  destinations: [{ latitude: 48.86, longitude: 2.34 }],
+  mode: "car",
+});
+assert(
+  matrix.durations_minutes.length === 2 &&
+    matrix.durations_minutes[0][0] === 10 &&
+    matrix.durations_minutes[1][0] === 20,
+  "get_travel_time_matrix returns duration matrices (text + coordinate origins)",
+);
+assert(
+  matrix.origins[0].resolved_from === "Tour Eiffel" &&
+    matrix.best_destination_index_per_origin[0] === 0,
+  "get_travel_time_matrix geocodes text origins and picks best destinations",
+);
+
+// 18. search_along_route
+const along = await callToolJson("search_along_route", {
+  from: "Tour Eiffel",
+  to: { latitude: 48.8606, longitude: 2.3376 },
+  category: "amenity",
+  subcategories: ["fuel"],
+  max_distance: 500,
+});
+assert(
+  along.count === 2 && along.pois[0].name === "Station A",
+  "search_along_route finds POIs ordered along the route",
+);
+assert(
+  along.pois[0].along_route_km < along.pois[1].along_route_km &&
+    typeof along.pois[0].distance_from_route_m === "number",
+  "search_along_route computes along-route positions and detour distances",
+);
+assert(
+  overpassQueries.at(-1).includes("(around:500,"),
+  "search_along_route uses an Overpass around-polyline filter",
+);
+
+// 19. render_map
+const rendered = await client.callTool({
+  name: "render_map",
+  arguments: {
+    markers: [{ location: "Tour Eiffel", label: "Départ" }],
+    paths: [{ points: ROUTE_GEOMETRY }],
+    width: 400,
+    height: 300,
+  },
+});
+const renderedImage = rendered.content.find((item) => item.type === "image");
+const renderedMeta = JSON.parse(rendered.content.find((item) => item.type === "text").text);
+const renderedPng = Buffer.from(renderedImage?.data ?? "", "base64");
+assert(
+  !rendered.isError &&
+    renderedPng.readUInt32BE(16) === 400 &&
+    renderedPng.readUInt32BE(20) === 300,
+  "render_map produces a PNG of the requested size",
+);
+assert(
+  renderedMeta.markers.length === 1 &&
+    renderedMeta.markers[0].label === "Départ" &&
+    Number.isInteger(renderedMeta.zoom),
+  "render_map auto-fits zoom and reports the marker legend",
+);
+
+// 20. trace_power_line
+const trace = await callToolJson("trace_power_line", { way_id: 70001 });
+assert(
+  trace.method === "connectivity" && trace.ways_count === 2,
+  "trace_power_line follows compatible ways (and excludes different voltages)",
+);
+assert(
+  trace.total_length_km > 0 && trace.geojson.geometry.coordinates.length === 2,
+  "trace_power_line returns a GeoJSON MultiLineString with total length",
+);
+assert(
+  trace.terminals.length === 2 &&
+    trace.terminals.some((terminal) => terminal.nearby_substation?.name === "Poste Arrivée"),
+  "trace_power_line identifies terminals and nearby substations",
+);
+
+// 21. get_grid_summary
+const gridSummary = await callToolJson("get_grid_summary", {
+  location: "Tour Eiffel",
+  radius: 10000,
+});
+assert(
+  gridSummary.lines.count === 1 &&
+    gridSummary.lines.total_km > 0 &&
+    gridSummary.lines.km_by_voltage_class["150-300kV"] > 0,
+  "get_grid_summary aggregates line kilometers by voltage class",
+);
+assert(
+  gridSummary.substations.count === 1 && gridSummary.towers_and_poles.count === 12,
+  "get_grid_summary counts substations and towers/poles",
+);
+assert(
+  gridSummary.production.plants.count === 1 &&
+    gridSummary.production.plants.declared_total_mw === 12 &&
+    gridSummary.production.generators.count === 1,
+  "get_grid_summary aggregates production facilities and declared output",
+);
+
+// 22. text locations + compact/verbose behavior on core tools
+const compact = await callToolJson("find_nearby_places", { location: "Tour Eiffel", radius: 500 });
+assert(
+  compact.query.resolved_from === "Tour Eiffel" &&
+    compact.categories.amenity.cafe[0].tags === undefined,
+  "core tools accept text locations and omit raw tags by default",
+);
+const verboseNearby = await callToolJson("find_nearby_places", {
+  latitude: CENTER.lat,
+  longitude: CENTER.lon,
+  radius: 500,
+  verbose: true,
+});
+assert(
+  verboseNearby.categories.amenity.cafe[0].tags?.name === "Café Test",
+  "verbose: true restores raw OSM tags",
+);
+const areaSearch = await callToolJson("search_category", {
+  category: "amenity",
+  area: "Paris",
+  subcategories: ["cafe", "restaurant"],
+});
+assert(
+  areaSearch.count >= 2 && areaSearch.query.area === "Paris" && areaSearch.query.bbox.min_latitude === 48.81,
+  "search_category resolves a named area to its bounding box",
 );
 
 // resources

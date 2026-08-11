@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { ToolContext } from "./context.js";
+import { optionalPointParams, resolvePoint } from "./location.js";
 import {
   type OverpassElement,
   OSMClient,
@@ -9,13 +10,7 @@ import {
   latLonToTile,
   radiusToBbox,
 } from "./osm-client.js";
-import {
-  featureCoords,
-  jsonResult,
-  latitudeParam,
-  longitudeParam,
-  round,
-} from "./tool-helpers.js";
+import { featureCoords, jsonResult, round, tagsOut, verboseParam } from "./tool-helpers.js";
 
 const ROUTE_TYPES = [
   "bus",
@@ -86,8 +81,7 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
         "require the THUNDERFOREST_API_KEY environment variable). Returns the PNG tile plus " +
         "tile metadata and attribution.",
       inputSchema: {
-        latitude: latitudeParam("Latitude the tile must cover (decimal degrees)"),
-        longitude: longitudeParam("Longitude the tile must cover (decimal degrees)"),
+        ...optionalPointParams("Point the tile must cover"),
         zoom: z
           .number()
           .int()
@@ -101,8 +95,9 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
           .describe("Map style / layer to render"),
       },
     },
-    async ({ latitude, longitude, zoom, style }) => {
-      const { x, y } = latLonToTile(latitude, longitude, zoom);
+    async ({ location, latitude, longitude, zoom, style }) => {
+      const center = await resolvePoint(client, { location, latitude, longitude });
+      const { x, y } = latLonToTile(center.latitude, center.longitude, zoom);
       const tile = await client.getMapTile(style, zoom, x, y);
       const attribution =
         style === "standard"
@@ -118,7 +113,7 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
                 style,
                 zoom,
                 tile: { z: zoom, x, y },
-                center: { latitude, longitude },
+                center: { latitude: center.latitude, longitude: center.longitude },
                 attribution,
               },
               null,
@@ -143,8 +138,7 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
         "trolleybus, tram, train, subway, light rail, ferry), with ref, operator, network, " +
         "origin and destination.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(1000).describe("Search radius in meters"),
         transport_types: z
           .array(z.string())
@@ -163,18 +157,23 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
           .positive()
           .default(50)
           .describe("Maximum number of stops and of routes to return"),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius, transport_types, include_routes, limit }, extra) => {
+    async (
+      { location, latitude, longitude, radius, transport_types, include_routes, limit, verbose },
+      extra,
+    ) => {
       const ctx = new ToolContext(server, extra);
-      const bbox = radiusToBbox(latitude, longitude, radius);
+      const center = await resolvePoint(client, { location, latitude, longitude });
+      const bbox = radiusToBbox(center.latitude, center.longitude, radius);
       const requestedModes =
         transport_types && transport_types.length > 0
           ? normalizeModes(transport_types)
           : null;
 
       await ctx.info(
-        `Searching public transport within ${radius}m of (${latitude}, ${longitude})`,
+        `Searching public transport within ${radius}m of (${center.latitude}, ${center.longitude})`,
       );
 
       const stopElements = await client.findFeatures(
@@ -204,7 +203,12 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
         if (requestedModes && !modes.some((mode) => requestedModes.includes(mode))) {
           continue;
         }
-        const distance = haversineDistance(latitude, longitude, coords.latitude, coords.longitude);
+        const distance = haversineDistance(
+          center.latitude,
+          center.longitude,
+          coords.latitude,
+          coords.longitude,
+        );
         stops.push({
           id: element.id,
           type: element.type,
@@ -221,7 +225,7 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
           operator: tags.operator ?? null,
           network: tags.network ?? null,
           wheelchair: tags.wheelchair ?? null,
-          tags,
+          tags: tagsOut(tags, verbose),
         });
       }
       stops.sort((a, b) => a.distance - b.distance);
@@ -254,8 +258,9 @@ export function registerTransportTools(server: McpServer, client: OSMClient): vo
 
       return jsonResult({
         query: {
-          latitude,
-          longitude,
+          latitude: center.latitude,
+          longitude: center.longitude,
+          resolved_from: center.resolved_from ?? null,
           radius,
           transport_types: requestedModes,
           include_routes,

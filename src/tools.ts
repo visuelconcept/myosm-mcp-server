@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { ToolContext } from "./context.js";
+import { locationSchema, optionalPointParams, resolveLocation, resolvePoint } from "./location.js";
 import {
   type OverpassElement,
   OSMClient,
@@ -15,6 +16,8 @@ import {
   latitudeParam,
   longitudeParam,
   round,
+  tagsOut,
+  verboseParam,
 } from "./tool-helpers.js";
 
 /**
@@ -52,7 +55,6 @@ function extractSteps(route: Record<string, any>) {
   }
   return steps;
 }
-
 
 export function registerTools(server: McpServer, client: OSMClient): void {
   // -------------------------------------------------------------------------
@@ -121,8 +123,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "grouped by OSM category and subcategory — useful for location-based recommendations " +
         "and proximity-based decision making.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(1000).describe("Search radius in meters"),
         categories: z
           .array(z.string())
@@ -132,17 +133,26 @@ export function registerTools(server: McpServer, client: OSMClient): void {
               "If omitted, searches common categories.",
           ),
         limit: z.number().int().positive().default(20).describe("Maximum number of total results"),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius, categories, limit }, extra) => {
+    async ({ location, latitude, longitude, radius, categories, limit, verbose }, extra) => {
       const ctx = new ToolContext(server, extra);
+      const center = await resolvePoint(client, { location, latitude, longitude });
       const effectiveCategories =
         categories && categories.length > 0
           ? categories
           : ["amenity", "shop", "tourism", "leisure"];
 
-      await ctx.info(`Searching for places within ${radius}m of (${latitude}, ${longitude})`);
-      const places = await client.getNearbyPois(latitude, longitude, radius, effectiveCategories);
+      await ctx.info(
+        `Searching for places within ${radius}m of (${center.latitude}, ${center.longitude})`,
+      );
+      const places = await client.getNearbyPois(
+        center.latitude,
+        center.longitude,
+        radius,
+        effectiveCategories,
+      );
 
       const resultsByCategory: Record<string, Record<string, any[]>> = {};
       for (const place of places.slice(0, limit)) {
@@ -157,7 +167,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
               name: tags.name ?? "Unnamed",
               latitude: place.lat,
               longitude: place.lon,
-              tags,
+              tags: tagsOut(tags, verbose),
             });
           }
         }
@@ -170,7 +180,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
       );
 
       return jsonResult({
-        query: { latitude, longitude, radius },
+        query: {
+          latitude: center.latitude,
+          longitude: center.longitude,
+          resolved_from: center.resolved_from ?? null,
+          radius,
+        },
         categories: resultsByCategory,
         total_count: totalCount,
       });
@@ -190,10 +205,18 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "the route geometry (GeoJSON) and waypoints. Use steps/overview/annotations to control " +
         "the response size.",
       inputSchema: {
-        from_latitude: latitudeParam("Starting point latitude (decimal degrees)"),
-        from_longitude: longitudeParam("Starting point longitude (decimal degrees)"),
-        to_latitude: latitudeParam("Destination latitude (decimal degrees)"),
-        to_longitude: longitudeParam("Destination longitude (decimal degrees)"),
+        from_location: z
+          .string()
+          .optional()
+          .describe("Starting point as a place name or address (alternative to from_latitude/from_longitude)"),
+        from_latitude: z.number().min(-90).max(90).optional().describe("Starting point latitude"),
+        from_longitude: z.number().min(-180).max(180).optional().describe("Starting point longitude"),
+        to_location: z
+          .string()
+          .optional()
+          .describe("Destination as a place name or address (alternative to to_latitude/to_longitude)"),
+        to_latitude: z.number().min(-90).max(90).optional().describe("Destination latitude"),
+        to_longitude: z.number().min(-180).max(180).optional().describe("Destination longitude"),
         mode: z
           .string()
           .default("car")
@@ -206,8 +229,33 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         annotations: z.boolean().default(false).describe("Include additional segment info"),
       },
     },
-    async ({ from_latitude, from_longitude, to_latitude, to_longitude, mode, steps, overview, annotations }, extra) => {
+    async (
+      {
+        from_location,
+        from_latitude,
+        from_longitude,
+        to_location,
+        to_latitude,
+        to_longitude,
+        mode,
+        steps,
+        overview,
+        annotations,
+      },
+      extra,
+    ) => {
       const ctx = new ToolContext(server, extra);
+
+      const from = await resolvePoint(
+        client,
+        { location: from_location, latitude: from_latitude, longitude: from_longitude },
+        "from_",
+      );
+      const to = await resolvePoint(
+        client,
+        { location: to_location, latitude: to_latitude, longitude: to_longitude },
+        "to_",
+      );
 
       const validModes = ["car", "bike", "foot"];
       let effectiveMode = mode;
@@ -217,14 +265,14 @@ export function registerTools(server: McpServer, client: OSMClient): void {
       }
 
       await ctx.info(
-        `Calculating ${effectiveMode} route from (${from_latitude}, ${from_longitude}) to (${to_latitude}, ${to_longitude})`,
+        `Calculating ${effectiveMode} route from (${from.latitude}, ${from.longitude}) to (${to.latitude}, ${to.longitude})`,
       );
 
       const routeData = await client.getRoute(
-        from_latitude,
-        from_longitude,
-        to_latitude,
-        to_longitude,
+        from.latitude,
+        from.longitude,
+        to.latitude,
+        to.longitude,
         effectiveMode,
         { steps, overview, annotations },
       );
@@ -239,6 +287,16 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           distance: route.distance, // meters
           duration: route.duration, // seconds
           mode: effectiveMode,
+        },
+        from: {
+          latitude: from.latitude,
+          longitude: from.longitude,
+          resolved_from: from.resolved_from ?? null,
+        },
+        to: {
+          latitude: to.latitude,
+          longitude: to.longitude,
+          resolved_from: to.resolved_from ?? null,
         },
         directions: extractSteps(route),
         geometry: route.geometry,
@@ -255,31 +313,69 @@ export function registerTools(server: McpServer, client: OSMClient): void {
     {
       title: "Search places by category",
       description:
-        "Search for specific types of places within a rectangular geographic area. Filters " +
-        'places by OSM category (e.g., "amenity", "shop") and optional subcategories ' +
-        '(e.g., ["restaurant", "cafe"]) and returns their coordinates, names and metadata.',
+        "Search for specific types of places within a geographic area — either a named area " +
+        '(e.g., "Lyon 3e arrondissement") or an explicit bounding box. Filters places by OSM ' +
+        'category (e.g., "amenity", "shop") and optional subcategories (e.g., ["restaurant", ' +
+        '"cafe"]) and returns their coordinates, names and metadata.',
       inputSchema: {
         category: z
           .string()
           .describe('Main OSM category to search for (e.g., "amenity", "shop", "tourism")'),
-        min_latitude: latitudeParam("Southern boundary of search area (decimal degrees)"),
-        min_longitude: longitudeParam("Western boundary of search area (decimal degrees)"),
-        max_latitude: latitudeParam("Northern boundary of search area (decimal degrees)"),
-        max_longitude: longitudeParam("Eastern boundary of search area (decimal degrees)"),
+        area: z
+          .string()
+          .optional()
+          .describe(
+            "Named area to search in (city, district, ...) — its bounding box is resolved " +
+              "automatically (alternative to the min/max coordinates)",
+          ),
+        min_latitude: z.number().min(-90).max(90).optional().describe("Southern boundary"),
+        min_longitude: z.number().min(-180).max(180).optional().describe("Western boundary"),
+        max_latitude: z.number().min(-90).max(90).optional().describe("Northern boundary"),
+        max_longitude: z.number().min(-180).max(180).optional().describe("Eastern boundary"),
         subcategories: z
           .array(z.string())
           .optional()
           .describe('Optional list of specific subcategories to filter by (e.g., ["restaurant", "cafe"])'),
+        verbose: verboseParam(),
       },
     },
-    async ({ category, min_latitude, min_longitude, max_latitude, max_longitude, subcategories }, extra) => {
+    async (
+      { category, area, min_latitude, min_longitude, max_latitude, max_longitude, subcategories, verbose },
+      extra,
+    ) => {
       const ctx = new ToolContext(server, extra);
-      const bbox = {
-        minLat: min_latitude,
-        minLon: min_longitude,
-        maxLat: max_latitude,
-        maxLon: max_longitude,
-      };
+
+      let bbox: { minLat: number; minLon: number; maxLat: number; maxLon: number };
+      if (area) {
+        const matches = await client.geocode(area, 1);
+        const box = matches[0]?.boundingbox;
+        if (!box || box.length < 4) {
+          throw new Error(`Could not resolve the bounding box of '${area}'`);
+        }
+        // Nominatim bounding boxes are [south, north, west, east].
+        bbox = {
+          minLat: parseFloat(box[0]),
+          maxLat: parseFloat(box[1]),
+          minLon: parseFloat(box[2]),
+          maxLon: parseFloat(box[3]),
+        };
+      } else if (
+        min_latitude !== undefined &&
+        min_longitude !== undefined &&
+        max_latitude !== undefined &&
+        max_longitude !== undefined
+      ) {
+        bbox = {
+          minLat: min_latitude,
+          minLon: min_longitude,
+          maxLat: max_latitude,
+          maxLon: max_longitude,
+        };
+      } else {
+        throw new Error(
+          "Provide either 'area' or all of min_latitude, min_longitude, max_latitude, max_longitude",
+        );
+      }
 
       await ctx.info(`Searching for ${category} in bounding box`);
       const features = await client.searchFeaturesByCategory(bbox, category, subcategories);
@@ -298,7 +394,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           coordinates: coords,
           category,
           subcategory: tags[category],
-          tags,
+          tags: tagsOut(tags, verbose),
         });
       }
 
@@ -306,11 +402,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         query: {
           category,
           subcategories: subcategories ?? null,
+          area: area ?? null,
           bbox: {
-            min_latitude,
-            min_longitude,
-            max_latitude,
-            max_longitude,
+            min_latitude: bbox.minLat,
+            min_longitude: bbox.minLon,
+            max_latitude: bbox.maxLat,
+            max_longitude: bbox.maxLon,
           },
         },
         results,
@@ -328,31 +425,33 @@ export function registerTools(server: McpServer, client: OSMClient): void {
       title: "Suggest meeting point",
       description:
         "Find the optimal meeting place for multiple people coming from different locations: " +
-        "computes the central point and recommends nearby venues of the requested type.",
+        "computes the central point and recommends nearby venues of the requested type. " +
+        "Locations can be place names or coordinates.",
       inputSchema: {
         locations: z
-          .array(
-            z.object({
-              latitude: latitudeParam("Latitude of this person's location"),
-              longitude: longitudeParam("Longitude of this person's location"),
-            }),
-          )
+          .array(locationSchema)
           .min(2, "Need at least two locations to suggest a meeting point")
-          .describe("Locations of all participants"),
+          .describe("Locations of all participants (place names or {latitude, longitude})"),
         venue_type: z
           .string()
           .default("cafe")
           .describe('Type of venue to suggest ("cafe", "restaurant", "bar", "library", ...)'),
+        verbose: verboseParam(),
       },
     },
-    async ({ locations, venue_type }, extra) => {
+    async ({ locations, venue_type, verbose }, extra) => {
       const ctx = new ToolContext(server, extra);
 
-      const avgLat = locations.reduce((sum, loc) => sum + loc.latitude, 0) / locations.length;
-      const avgLon = locations.reduce((sum, loc) => sum + loc.longitude, 0) / locations.length;
+      const resolved = [];
+      for (const location of locations) {
+        resolved.push(await resolveLocation(client, location));
+      }
+
+      const avgLat = resolved.reduce((sum, loc) => sum + loc.latitude, 0) / resolved.length;
+      const avgLon = resolved.reduce((sum, loc) => sum + loc.longitude, 0) / resolved.length;
 
       await ctx.info(
-        `Calculating center point for ${locations.length} locations: (${avgLat}, ${avgLon})`,
+        `Calculating center point for ${resolved.length} locations: (${avgLat}, ${avgLon})`,
       );
 
       const matchVenues = (venues: OverpassElement[]) =>
@@ -363,7 +462,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
             name: venue.tags?.name ?? "Unnamed Venue",
             latitude: venue.lat,
             longitude: venue.lon,
-            tags: venue.tags ?? {},
+            tags: tagsOut(venue.tags ?? {}, verbose),
           }));
 
       let matchingVenues = matchVenues(
@@ -379,6 +478,11 @@ export function registerTools(server: McpServer, client: OSMClient): void {
 
       return jsonResult({
         center_point: { latitude: avgLat, longitude: avgLon },
+        participants: resolved.map((loc) => ({
+          latitude: loc.latitude,
+          longitude: loc.longitude,
+          resolved_from: loc.resolved_from ?? null,
+        })),
         suggested_venues: matchingVenues.slice(0, 5),
         venue_type,
         total_options: matchingVenues.length,
@@ -397,13 +501,14 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "Generate a comprehensive profile of an area: all amenities and features around a " +
         "point, organized by category and subcategory, plus the address of the center point.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(500).describe("Search radius in meters"),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius }, extra) => {
+    async ({ location, latitude, longitude, radius, verbose }, extra) => {
       const ctx = new ToolContext(server, extra);
+      const center = await resolvePoint(client, { location, latitude, longitude });
       const categories = [
         "amenity",
         "shop",
@@ -413,7 +518,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "historic",
         "public_transport",
       ];
-      const bbox = radiusToBbox(latitude, longitude, radius);
+      const bbox = radiusToBbox(center.latitude, center.longitude, radius);
 
       const results: Record<string, Record<string, any[]>> = {};
       for (const [index, category] of categories.entries()) {
@@ -435,7 +540,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
               name: tags.name ?? "Unnamed",
               coordinates: featureCoords(feature) ?? {},
               type: feature.type,
-              tags,
+              tags: tagsOut(tags, verbose),
             });
           }
           results[category] = subcategories;
@@ -447,7 +552,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
 
       let addressInfo: Record<string, any>;
       try {
-        addressInfo = await client.reverseGeocode(latitude, longitude);
+        addressInfo = await client.reverseGeocode(center.latitude, center.longitude);
       } catch {
         addressInfo = { error: "Could not retrieve address information" };
       }
@@ -461,7 +566,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
       );
 
       return jsonResult({
-        query: { latitude, longitude, radius },
+        query: {
+          latitude: center.latitude,
+          longitude: center.longitude,
+          resolved_from: center.resolved_from ?? null,
+          radius,
+        },
         address: addressInfo,
         categories: results,
         total_features: totalFeatures,
@@ -481,8 +591,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "Locate educational institutions (schools, kindergartens, colleges, universities) " +
         "near a location, optionally filtered by education level, sorted by distance.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(2000).describe("Search radius in meters"),
         education_levels: z
           .array(z.string())
@@ -490,10 +599,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           .describe(
             'Optional list of education levels to filter by (e.g., ["elementary", "secondary", "university"])',
           ),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius, education_levels }) => {
-      const bbox = radiusToBbox(latitude, longitude, radius);
+    async ({ location, latitude, longitude, radius, education_levels, verbose }) => {
+      const center = await resolvePoint(client, { location, latitude, longitude });
+      const bbox = radiusToBbox(center.latitude, center.longitude, radius);
       const schools = await client.findFeatures(
         bbox,
         [
@@ -524,7 +635,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           continue;
         }
 
-        const distance = haversineDistance(latitude, longitude, coords.latitude, coords.longitude);
+        const distance = haversineDistance(
+          center.latitude,
+          center.longitude,
+          coords.latitude,
+          coords.longitude,
+        );
         results.push({
           id: school.id,
           name: tags.name ?? "Unnamed School",
@@ -534,14 +650,20 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           coordinates: coords,
           distance: round(distance, 1),
           address: addressFromTags(tags),
-          tags,
+          tags: tagsOut(tags, verbose),
         });
       }
 
       results.sort((a, b) => a.distance - b.distance);
 
       return jsonResult({
-        query: { latitude, longitude, radius, education_levels: education_levels ?? null },
+        query: {
+          latitude: center.latitude,
+          longitude: center.longitude,
+          resolved_from: center.resolved_from ?? null,
+          radius,
+          education_levels: education_levels ?? null,
+        },
         schools: results,
         count: results.length,
       });
@@ -559,10 +681,18 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "Perform a detailed commute analysis between home and work locations, comparing " +
         "multiple transportation modes with distances, durations and turn-by-turn directions.",
       inputSchema: {
-        home_latitude: latitudeParam("Home location latitude (decimal degrees)"),
-        home_longitude: longitudeParam("Home location longitude (decimal degrees)"),
-        work_latitude: latitudeParam("Workplace location latitude (decimal degrees)"),
-        work_longitude: longitudeParam("Workplace location longitude (decimal degrees)"),
+        home_location: z
+          .string()
+          .optional()
+          .describe("Home as a place name or address (alternative to home_latitude/home_longitude)"),
+        home_latitude: z.number().min(-90).max(90).optional().describe("Home latitude"),
+        home_longitude: z.number().min(-180).max(180).optional().describe("Home longitude"),
+        work_location: z
+          .string()
+          .optional()
+          .describe("Workplace as a place name or address (alternative to work_latitude/work_longitude)"),
+        work_latitude: z.number().min(-90).max(90).optional().describe("Workplace latitude"),
+        work_longitude: z.number().min(-180).max(180).optional().describe("Workplace longitude"),
         modes: z
           .array(z.string())
           .default(["car", "foot", "bike"])
@@ -573,12 +703,26 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           .describe('Optional departure time (format: "HH:MM") for time-sensitive routing'),
       },
     },
-    async ({ home_latitude, home_longitude, work_latitude, work_longitude, modes, depart_at }, extra) => {
+    async (
+      { home_location, home_latitude, home_longitude, work_location, work_latitude, work_longitude, modes, depart_at },
+      extra,
+    ) => {
       const ctx = new ToolContext(server, extra);
 
+      const home = await resolvePoint(
+        client,
+        { location: home_location, latitude: home_latitude, longitude: home_longitude },
+        "home_",
+      );
+      const work = await resolvePoint(
+        client,
+        { location: work_location, latitude: work_latitude, longitude: work_longitude },
+        "work_",
+      );
+
       const [homeInfo, workInfo] = await Promise.all([
-        client.reverseGeocode(home_latitude, home_longitude),
-        client.reverseGeocode(work_latitude, work_longitude),
+        client.reverseGeocode(home.latitude, home.longitude),
+        client.reverseGeocode(work.latitude, work.longitude),
       ]);
 
       const commuteOptions: Array<Record<string, any>> = [];
@@ -586,10 +730,10 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         await ctx.info(`Calculating ${mode} route for commute analysis`);
         try {
           const routeData = await client.getRoute(
-            home_latitude,
-            home_longitude,
-            work_latitude,
-            work_longitude,
+            home.latitude,
+            home.longitude,
+            work.latitude,
+            work.longitude,
             mode,
             { steps: true },
           );
@@ -614,11 +758,11 @@ export function registerTools(server: McpServer, client: OSMClient): void {
 
       return jsonResult({
         home: {
-          coordinates: { latitude: home_latitude, longitude: home_longitude },
+          coordinates: { latitude: home.latitude, longitude: home.longitude },
           address: homeInfo?.display_name ?? "Unknown location",
         },
         work: {
-          coordinates: { latitude: work_latitude, longitude: work_longitude },
+          coordinates: { latitude: work.latitude, longitude: work.longitude },
           address: workInfo?.display_name ?? "Unknown location",
         },
         commute_options: commuteOptions,
@@ -639,18 +783,19 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "Locate electric vehicle charging stations near a location, optionally filtered by " +
         "connector type and minimum charging power, sorted by distance.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(5000).describe("Search radius in meters"),
         connector_types: z
           .array(z.string())
           .optional()
           .describe('Optional list of connector types to filter by (e.g., ["type2", "ccs", "tesla"])'),
         min_power: z.number().positive().optional().describe("Minimum charging power in kW"),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius, connector_types, min_power }) => {
-      const bbox = radiusToBbox(latitude, longitude, radius);
+    async ({ location, latitude, longitude, radius, connector_types, min_power, verbose }) => {
+      const center = await resolvePoint(client, { location, latitude, longitude });
+      const bbox = radiusToBbox(center.latitude, center.longitude, radius);
       const stations = await client.findFeatures(
         bbox,
         [{ types: ["node", "way"], key: "amenity", value: "charging_station" }],
@@ -692,7 +837,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           continue;
         }
 
-        const distance = haversineDistance(latitude, longitude, coords.latitude, coords.longitude);
+        const distance = haversineDistance(
+          center.latitude,
+          center.longitude,
+          coords.latitude,
+          coords.longitude,
+        );
         results.push({
           id: station.id,
           name: tags.name ?? "Unnamed Charging Station",
@@ -706,7 +856,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           access: tags.access ?? "public",
           opening_hours: tags.opening_hours ?? "Unknown",
           address: addressFromTags(tags),
-          tags,
+          tags: tagsOut(tags, verbose),
         });
       }
 
@@ -714,8 +864,9 @@ export function registerTools(server: McpServer, client: OSMClient): void {
 
       return jsonResult({
         query: {
-          latitude,
-          longitude,
+          latitude: center.latitude,
+          longitude: center.longitude,
+          resolved_from: center.resolved_from ?? null,
           radius,
           connector_types: connector_types ?? null,
           min_power: min_power ?? null,
@@ -738,14 +889,15 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "green spaces and services, with per-category scores, a walkability score and an " +
         "overall neighborhood score. Useful for real estate decisions and relocation planning.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(1000).describe("Analysis radius in meters"),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius }, extra) => {
+    async ({ location, latitude, longitude, radius, verbose }, extra) => {
       const ctx = new ToolContext(server, extra);
-      const addressInfo = await client.reverseGeocode(latitude, longitude);
+      const center = await resolvePoint(client, { location, latitude, longitude });
+      const addressInfo = await client.reverseGeocode(center.latitude, center.longitude);
 
       const categories: Array<{ name: string; tags: string[] }> = [
         // Essential services
@@ -771,7 +923,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         { name: "services", tags: ["amenity=bank", "amenity=post_office", "amenity=atm"] },
       ];
 
-      const bbox = radiusToBbox(latitude, longitude, radius);
+      const bbox = radiusToBbox(center.latitude, center.longitude, radius);
       const results: Record<string, any> = {};
       const scores: Record<string, number> = {};
 
@@ -798,8 +950,8 @@ export function registerTools(server: McpServer, client: OSMClient): void {
               continue;
             }
             const distance = haversineDistance(
-              latitude,
-              longitude,
+              center.latitude,
+              center.longitude,
               coords.latitude,
               coords.longitude,
             );
@@ -809,7 +961,7 @@ export function registerTools(server: McpServer, client: OSMClient): void {
               type: feature.type,
               coordinates: coords,
               distance: round(distance, 1),
-              tags,
+              tags: tagsOut(tags, verbose),
             });
           }
 
@@ -873,7 +1025,8 @@ export function registerTools(server: McpServer, client: OSMClient): void {
 
       return jsonResult({
         location: {
-          coordinates: { latitude, longitude },
+          coordinates: { latitude: center.latitude, longitude: center.longitude },
+          resolved_from: center.resolved_from ?? null,
           address: addressInfo?.display_name ?? "Unknown location",
         },
         scores: {
@@ -901,17 +1054,18 @@ export function registerTools(server: McpServer, client: OSMClient): void {
         "Locate parking facilities (lots, garages, street parking) near a location with " +
         "capacity, fee and access information, sorted by distance.",
       inputSchema: {
-        latitude: latitudeParam("Center point latitude (decimal degrees)"),
-        longitude: longitudeParam("Center point longitude (decimal degrees)"),
+        ...optionalPointParams("Center point"),
         radius: z.number().positive().default(1000).describe("Search radius in meters"),
         parking_type: z
           .string()
           .optional()
           .describe('Optional filter for parking type ("surface", "underground", "multi-storey", ...)'),
+        verbose: verboseParam(),
       },
     },
-    async ({ latitude, longitude, radius, parking_type }) => {
-      const bbox = radiusToBbox(latitude, longitude, radius);
+    async ({ location, latitude, longitude, radius, parking_type, verbose }) => {
+      const center = await resolvePoint(client, { location, latitude, longitude });
+      const bbox = radiusToBbox(center.latitude, center.longitude, radius);
       const facilities = await client.findFeatures(
         bbox,
         [{ types: ["node", "way", "relation"], key: "amenity", value: "parking" }],
@@ -931,7 +1085,12 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           continue;
         }
 
-        const distance = haversineDistance(latitude, longitude, coords.latitude, coords.longitude);
+        const distance = haversineDistance(
+          center.latitude,
+          center.longitude,
+          coords.latitude,
+          coords.longitude,
+        );
         results.push({
           id: facility.id,
           name: tags.name ?? "Unnamed Parking",
@@ -944,14 +1103,20 @@ export function registerTools(server: McpServer, client: OSMClient): void {
           opening_hours: tags.opening_hours ?? "Unknown",
           levels: tags.levels ?? "1",
           address: addressFromTags(tags),
-          tags,
+          tags: tagsOut(tags, verbose),
         });
       }
 
       results.sort((a, b) => a.distance - b.distance);
 
       return jsonResult({
-        query: { latitude, longitude, radius, parking_type: parking_type ?? null },
+        query: {
+          latitude: center.latitude,
+          longitude: center.longitude,
+          resolved_from: center.resolved_from ?? null,
+          radius,
+          parking_type: parking_type ?? null,
+        },
         parking_facilities: results,
         count: results.length,
       });
