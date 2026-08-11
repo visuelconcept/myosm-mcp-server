@@ -30,7 +30,11 @@ npm install
 npm run build
 ```
 
-### In MCP hosts (Claude Desktop, Claude Code, Cursor, Windsurf, …)
+## Running the server
+
+The server supports both MCP transports; stdio is the default.
+
+### stdio (local MCP hosts: Claude Desktop, Claude Code, Cursor, Windsurf, …)
 
 ```json
 {
@@ -53,6 +57,45 @@ Claude Desktop config file locations:
 
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%/Claude/claude_desktop_config.json`
+
+### Streamable HTTP (remote deployments, shared server, multiple clients)
+
+Start the server in HTTP mode:
+
+```bash
+node dist/index.js --http --port 3000        # or: npm run start:http
+# equivalent: MCP_TRANSPORT=http PORT=3000 node dist/index.js
+```
+
+The MCP endpoint is `http://127.0.0.1:3000/mcp` (sessions are managed per client
+via the `Mcp-Session-Id` header) and `GET /health` reports liveness for
+deployment probes.
+
+Declare it in an MCP host by URL:
+
+```json
+{
+  "mcpServers": {
+    "myosm-mcp-server": {
+      "type": "http",
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
+
+With Claude Code:
+
+```bash
+claude mcp add --transport http myosm http://127.0.0.1:3000/mcp
+```
+
+CLI options: `--http`, `--stdio`, `--host <address>`, `--port <number>`, `--help`.
+
+> **Security**: the HTTP server binds to `127.0.0.1` by default and has no built-in
+> authentication. To expose it (`--host 0.0.0.0`), put it behind a reverse proxy that
+> handles TLS and auth, and set `MCP_ALLOWED_HOSTS` (comma-separated `Host` header
+> values, e.g. `MCP_ALLOWED_HOSTS=mcp.example.com`) to enable DNS-rebinding protection.
 
 ## Tools
 
@@ -108,6 +151,10 @@ All configuration is optional and done through environment variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
+| `MCP_HTTP_HOST` | `127.0.0.1` | HTTP bind address |
+| `MCP_HTTP_PORT` / `PORT` | `3000` | HTTP port |
+| `MCP_ALLOWED_HOSTS` | — | Comma-separated `Host` values; enables DNS-rebinding protection |
 | `NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Geocoding endpoint (self-hosted Nominatim) |
 | `OVERPASS_URL` | `https://overpass-api.de/api/interpreter` | Overpass API endpoint |
 | `OSRM_URL` | `https://router.project-osrm.org` | Routing endpoint (self-hosted OSRM) |
@@ -130,20 +177,21 @@ Behind a corporate proxy, run Node with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.15) 
 ```bash
 npm run build       # compile TypeScript to dist/
 npm run watch       # recompile on change
-npm test            # protocol smoke test + offline integration tests (mocked OSM APIs)
+npm test            # smoke + integration + HTTP transport tests (all offline)
 SMOKE_LIVE=1 npm run smoke   # additionally exercise the real public OSM APIs
 npm run inspector   # debug with the MCP Inspector
 ```
 
-The integration tests (`test/integration.mjs`) run the server against local mock
-implementations of Nominatim, OSRM, Overpass and the tile server, so they work
-without network access.
+The integration and HTTP tests (`test/integration.mjs`, `test/http.mjs`) run the
+server against local mock implementations of Nominatim, OSRM, Overpass and the
+tile server, so they work without network access.
 
 ## Differences from the Python original
 
 Same 12 tools and 2 resources, plus:
 
 - 4 new tools: `get_map_tile`, `find_public_transport`, `find_power_infrastructure`, `find_power_plants`
+- Streamable HTTP transport (`--http`) in addition to stdio, with per-client sessions and a `/health` endpoint
 - Overpass queries use `out center`, so ways/relations (building-mapped schools, parking lots, …) return usable coordinates instead of being dropped
 - `search_category` subcategory filtering uses a valid Overpass regex filter (the original generated invalid QL)
 - Transport modes are mapped to canonical OSRM profiles (`driving`/`cycling`/`walking`)
