@@ -16,7 +16,7 @@ The server gives LLMs tools to interact with OpenStreetMap data:
 - Explore areas and run neighborhood livability analysis
 - Find schools, EV charging stations and parking facilities
 - **Map layers**: fetch rendered map tiles (standard, transport, cycle, …) as images, and render composed, annotated map images (markers + routes/lines drawn on top)
-- **Public transport layer**: stops, stations and transit route lines (bus, tram, train, subway, light rail, ferry)
+- **Public transport layer**: stops, stations and transit route lines (bus, tram, train, subway, light rail, ferry), plus full network topology — lines with ordered stations, interchanges and connections
 - **Energy layer**: power lines, underground cables, substations and transformers (with voltage filtering), electricity production facilities (power plants and generators, filterable by source and output), full power-line tracing and territorial grid summaries
 - **Trip tooling**: travel time/distance matrices (N×M) and POI search along a route corridor
 
@@ -145,6 +145,7 @@ CLI options: `--http`, `--stdio`, `--host <address>`, `--port <number>`, `--help
 | `render_map` | Composed, annotated map image (PNG): stitched tiles + numbered markers + colored paths — pass a route geometry or a power-line trace directly |
 | `get_map_tile` | Single rendered map tile (PNG image) covering a location — styles: `standard`, `transport`, `cycle`, `landscape`, `outdoor` |
 | `find_public_transport` | Public transport layer: stops/stations/terminals plus transit route lines (`bus`, `trolleybus`, `tram`, `train`, `subway`, `light_rail`, `ferry`), filterable by mode |
+| `get_transit_network` | Network topology of an area: lines with ordered station sequences (route relations + route_master grouping), stations with the lines serving them, interchanges, and per-line adjacent-station segments (graph edges) |
 
 ### Energy
 
@@ -205,7 +206,7 @@ tile server, so they work without network access.
 
 Same 12 tools and 2 resources, plus:
 
-- 9 new tools: `get_map_tile`, `render_map`, `find_public_transport`, `find_power_infrastructure`, `find_power_plants`, `trace_power_line`, `get_grid_summary`, `get_travel_time_matrix`, `search_along_route`
+- 10 new tools: `get_map_tile`, `render_map`, `find_public_transport`, `get_transit_network`, `find_power_infrastructure`, `find_power_plants`, `trace_power_line`, `get_grid_summary`, `get_travel_time_matrix`, `search_along_route`
 - Locations accepted as free text everywhere (automatic geocoding) and compact responses by default (`verbose: true` for raw OSM tags)
 - Streamable HTTP transport (`--http`) in addition to stdio, with per-client sessions and a `/health` endpoint
 - Overpass queries use `out center`, so ways/relations (building-mapped schools, parking lots, …) return usable coordinates instead of being dropped

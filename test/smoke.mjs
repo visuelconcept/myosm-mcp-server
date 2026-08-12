@@ -31,6 +31,7 @@ const EXPECTED_TOOLS = [
   "render_map",
   "trace_power_line",
   "get_grid_summary",
+  "get_transit_network",
 ];
 
 const EXPECTED_TEMPLATES = [

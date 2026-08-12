@@ -222,6 +222,75 @@ const TRACE_SUBSTATION = [
   },
 ];
 
+const TRANSIT_NETWORK = [
+  // Line 1: two directional variants grouped by a route_master.
+  {
+    type: "relation",
+    id: 60001,
+    tags: {
+      type: "route",
+      route: "subway",
+      ref: "1",
+      name: "Métro 1: Alpha → Central",
+      colour: "#FFCD00",
+      network: "TestNet",
+      operator: "RATP",
+      from: "Alpha",
+      to: "Central",
+    },
+    members: [
+      { type: "node", ref: 8101, role: "stop" },
+      { type: "node", ref: 8102, role: "stop" },
+      { type: "node", ref: 8103, role: "stop" },
+      { type: "way", ref: 9999, role: "" },
+    ],
+  },
+  {
+    type: "relation",
+    id: 60002,
+    tags: {
+      type: "route",
+      route: "subway",
+      ref: "1",
+      name: "Métro 1: Central → Alpha",
+      colour: "#FFCD00",
+      network: "TestNet",
+      from: "Central",
+      to: "Alpha",
+    },
+    members: [
+      { type: "node", ref: 8103, role: "stop" },
+      { type: "node", ref: 8102, role: "stop" },
+      { type: "node", ref: 8101, role: "stop" },
+    ],
+  },
+  // Line 2: no route_master, shares the "Central" station with line 1.
+  {
+    type: "relation",
+    id: 60003,
+    tags: { type: "route", route: "subway", ref: "2", name: "Métro 2: Central → Delta", network: "TestNet" },
+    members: [
+      { type: "node", ref: 8103, role: "stop" },
+      { type: "node", ref: 8104, role: "stop" },
+    ],
+  },
+  // Stop nodes.
+  { type: "node", id: 8101, lat: 48.855, lon: 2.29, tags: { name: "Alpha" } },
+  { type: "node", id: 8102, lat: 48.857, lon: 2.3, tags: { name: "Beta" } },
+  { type: "node", id: 8103, lat: 48.859, lon: 2.31, tags: { name: "Central" } },
+  { type: "node", id: 8104, lat: 48.861, lon: 2.32, tags: { name: "Delta" } },
+  // Route master grouping the two variants of line 1.
+  {
+    type: "relation",
+    id: 60010,
+    tags: { type: "route_master", route_master: "subway", ref: "1", name: "Métro 1", colour: "#FFCD00" },
+    members: [
+      { type: "relation", ref: 60001, role: "" },
+      { type: "relation", ref: 60002, role: "" },
+    ],
+  },
+];
+
 const POWER_PLANTS = [
   {
     type: "way",
@@ -256,6 +325,7 @@ const POWER_PLANTS = [
 const overpassQueries = [];
 
 function overpassFixture(query) {
+  if (query.includes("->.rts")) return TRANSIT_NETWORK;
   if (query.includes("out count")) {
     return [{ type: "count", id: 0, tags: { nodes: "12", ways: "0", relations: "0", total: "12" } }];
   }
@@ -758,6 +828,35 @@ const areaSearch = await callToolJson("search_category", {
 assert(
   areaSearch.count >= 2 && areaSearch.query.area === "Paris" && areaSearch.query.bbox.min_latitude === 48.81,
   "search_category resolves a named area to its bounding box",
+);
+
+// 23. get_transit_network
+const network = await callToolJson("get_transit_network", {
+  location: "Tour Eiffel",
+  radius: 3000,
+});
+const line1 = network.lines.find((line) => line.ref === "1");
+assert(
+  network.counts.lines === 2 && line1.name === "Métro 1" && line1.variants_count === 2,
+  "get_transit_network groups directional variants into lines via route_master",
+);
+assert(
+  JSON.stringify(line1.stations) === JSON.stringify(["Alpha", "Beta", "Central"]) &&
+    line1.colour === "#FFCD00" &&
+    JSON.stringify(line1.terminals) === JSON.stringify(["Alpha", "Central"]),
+  "get_transit_network returns the ordered station sequence of each line",
+);
+const central = network.stations.find((station) => station.name === "Central");
+assert(
+  central.is_interchange && central.lines.includes("1") && central.lines.includes("2"),
+  "get_transit_network lists the lines serving each station",
+);
+assert(
+  network.interchanges.length === 1 &&
+    network.interchanges[0].name === "Central" &&
+    network.segments["1"].length === 2 &&
+    network.segments["2"].length === 1,
+  "get_transit_network detects interchanges and builds per-line segments",
 );
 
 // resources

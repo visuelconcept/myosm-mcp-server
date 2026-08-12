@@ -32,6 +32,8 @@ export interface OverpassElement {
   bounds?: { minlat: number; minlon: number; maxlat: number; maxlon: number };
   /** Node ids of a way (body verbosity). */
   nodes?: number[];
+  /** Members of a relation (body verbosity), in mapped order. */
+  members?: Array<{ type: "node" | "way" | "relation"; ref: number; role: string }>;
   tags?: Record<string, string>;
 }
 
@@ -327,6 +329,27 @@ out center;`;
     const values = routeTypes.map(sanitizeTagPart).join("|");
     const query = `[out:json];\nrelation["type"="route"]["route"~"^(${values})$"](${overpassBbox(bbox)});\nout center;`;
     return this.overpass(query, "Failed to find public transport routes");
+  }
+
+  /**
+   * Fetch everything needed to reconstruct the transit network of an area in
+   * one query: the route relations WITH their ordered members, all their
+   * member nodes (stop positions/platforms with names and coordinates), and
+   * the route_master relations grouping directional variants into lines.
+   */
+  async getTransitNetworkElements(
+    bbox: BoundingBox,
+    routeTypes: string[],
+  ): Promise<OverpassElement[]> {
+    const values = routeTypes.map(sanitizeTagPart).join("|");
+    const query = `[out:json];
+relation["type"="route"]["route"~"^(${values})$"](${overpassBbox(bbox)})->.rts;
+.rts out body;
+node(r.rts);
+out body;
+relation(br.rts)["type"="route_master"];
+out body;`;
+    return this.overpass(query, "Failed to fetch the transit network");
   }
 
   /**
