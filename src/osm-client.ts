@@ -53,6 +53,57 @@ export interface RouteOptions {
 const DEFAULT_USER_AGENT =
   "myosm-mcp-server/1.0 (+https://github.com/visuelconcept/myosm-mcp-server)";
 
+const PUBLIC_NOMINATIM_URL = "https://nominatim.openstreetmap.org";
+
+/**
+ * The public Nominatim caps every client at one request per second and answers
+ * 429 above it. An MCP client is exactly the caller that breaks that rule: an
+ * LLM asked to place ten sites emits ten `geocode_address` calls in one turn,
+ * and the caller runs them back to back. So geocoding requests are serialized
+ * here with a minimum spacing rather than fired concurrently.
+ *
+ * A self-hosted instance has no such limit — hence the spacing defaults to 0
+ * as soon as NOMINATIM_URL points somewhere else (override with
+ * NOMINATIM_MIN_INTERVAL_MS either way).
+ */
+const NOMINATIM_MIN_INTERVAL_MS = 1_100;
+
+/** Statuses worth retrying: rate limiting and the transient gateway failures. */
+const RETRY_STATUSES = new Set([429, 502, 503, 504]);
+/** Retries after the first attempt; back-off is 1s, 2s, 4s unless Retry-After says otherwise. */
+const DEFAULT_MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1_000;
+const MAX_RETRY_DELAY_MS = 10_000;
+
+/**
+ * Geocoding answers are stable and the Nominatim usage policy explicitly asks
+ * clients to cache them. Entries hold the in-flight promise, so N concurrent
+ * lookups of the same place cost one request instead of N.
+ */
+const GEOCODE_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+const GEOCODE_CACHE_MAX_ENTRIES = 500;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Read a non-negative numeric setting from the environment; ignore junk. */
+function numberFromEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** `Retry-After` is either a delay in seconds or an HTTP date; both are legal. */
+function retryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+  const date = Date.parse(header);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
 /**
  * The user-facing transport modes map onto the canonical OSRM profile names
  * so the server also works against self-hosted OSRM instances (the public
@@ -156,6 +207,17 @@ export interface OSMClientOptions {
   userAgent?: string;
   timeoutMs?: number;
   overpassTimeoutMs?: number;
+  /** Minimum spacing between two Nominatim requests; 0 disables the queue. */
+  nominatimMinIntervalMs?: number;
+  /** Retries on 429/5xx after the first attempt; 0 disables retrying. */
+  maxRetries?: number;
+  /** Lifetime of a cached geocoding answer; 0 disables the cache. */
+  geocodeCacheTtlMs?: number;
+}
+
+interface CacheEntry {
+  value: Promise<unknown>;
+  expiresAt: number;
 }
 
 export class OSMClient {
@@ -165,11 +227,19 @@ export class OSMClient {
   private readonly userAgent: string;
   private readonly timeoutMs: number;
   private readonly overpassTimeoutMs: number;
+  private readonly nominatimMinIntervalMs: number;
+  private readonly maxRetries: number;
+  private readonly geocodeCacheTtlMs: number;
+  /** Tail of the Nominatim queue: every geocoding call chains onto it. */
+  private nominatimQueue: Promise<unknown> = Promise.resolve();
+  /** Earliest timestamp at which the next Nominatim request may leave. */
+  private nominatimNextAt = 0;
+  private readonly geocodeCache = new Map<string, CacheEntry>();
 
   constructor(options: OSMClientOptions = {}) {
     const strip = (url: string) => url.replace(/\/+$/, "");
     this.nominatimUrl = strip(
-      options.nominatimUrl ?? process.env.NOMINATIM_URL ?? "https://nominatim.openstreetmap.org",
+      options.nominatimUrl ?? process.env.NOMINATIM_URL ?? PUBLIC_NOMINATIM_URL,
     );
     this.overpassUrl = strip(
       options.overpassUrl ?? process.env.OVERPASS_URL ?? "https://overpass-api.de/api/interpreter",
@@ -180,6 +250,13 @@ export class OSMClient {
     this.userAgent = options.userAgent ?? process.env.OSM_USER_AGENT ?? DEFAULT_USER_AGENT;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.overpassTimeoutMs = options.overpassTimeoutMs ?? 60_000;
+    this.nominatimMinIntervalMs =
+      options.nominatimMinIntervalMs ??
+      numberFromEnv("NOMINATIM_MIN_INTERVAL_MS") ??
+      (this.nominatimUrl === PUBLIC_NOMINATIM_URL ? NOMINATIM_MIN_INTERVAL_MS : 0);
+    this.maxRetries = options.maxRetries ?? numberFromEnv("OSM_MAX_RETRIES") ?? DEFAULT_MAX_RETRIES;
+    this.geocodeCacheTtlMs =
+      options.geocodeCacheTtlMs ?? numberFromEnv("GEOCODE_CACHE_TTL_MS") ?? GEOCODE_CACHE_TTL_MS;
   }
 
   private async request(
@@ -188,35 +265,91 @@ export class OSMClient {
     init: RequestInit = {},
     timeoutMs = this.timeoutMs,
   ): Promise<Response> {
-    const response = await fetch(url, {
-      ...init,
-      headers: { "User-Agent": this.userAgent, ...(init.headers ?? {}) },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) {
-      throw new Error(`${errorMessage}: ${response.status} ${response.statusText}`);
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(url, {
+        ...init,
+        headers: { "User-Agent": this.userAgent, ...(init.headers ?? {}) },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (response.ok) return response;
+      if (attempt >= this.maxRetries || !RETRY_STATUSES.has(response.status)) {
+        // Say that the retries happened: an exhausted 429 means the service is
+        // saturated, not that the query was wrong — the caller (often an LLM)
+        // must not read it as "rephrase and try again".
+        const retried = attempt > 0 ? ` (after ${attempt} retr${attempt === 1 ? "y" : "ies"})` : "";
+        throw new Error(
+          `${errorMessage}: ${response.status} ${response.statusText}${retried}`,
+        );
+      }
+      const delay = Math.min(
+        retryAfterMs(response.headers.get("retry-after")) ?? RETRY_BASE_DELAY_MS * 2 ** attempt,
+        MAX_RETRY_DELAY_MS,
+      );
+      await sleep(delay);
     }
-    return response;
+  }
+
+  /**
+   * Run a Nominatim request in the shared queue, so concurrent geocoding calls
+   * leave one after another instead of arriving as a burst. Retries wait inside
+   * the slot on purpose: backing off while other calls keep firing at a
+   * rate-limited service would defeat the point.
+   */
+  private throttleNominatim<T>(task: () => Promise<T>): Promise<T> {
+    if (this.nominatimMinIntervalMs <= 0) return task();
+    const run = this.nominatimQueue.then(async () => {
+      const wait = this.nominatimNextAt - Date.now();
+      if (wait > 0) await sleep(wait);
+      try {
+        return await task();
+      } finally {
+        this.nominatimNextAt = Date.now() + this.nominatimMinIntervalMs;
+      }
+    });
+    // The queue must survive a failed call, hence the swallowed rejection here;
+    // `run` still carries the error to the caller.
+    this.nominatimQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Serve a geocoding lookup from cache, or run and memoize it. */
+  private cachedNominatim<T>(key: string, task: () => Promise<T>): Promise<T> {
+    if (this.geocodeCacheTtlMs <= 0) return this.throttleNominatim(task);
+    const hit = this.geocodeCache.get(key);
+    if (hit && hit.expiresAt > Date.now()) return hit.value as Promise<T>;
+    const value = this.throttleNominatim(task);
+    this.geocodeCache.set(key, { value, expiresAt: Date.now() + this.geocodeCacheTtlMs });
+    // A failure must not be remembered — the next call has to reach the service.
+    value.catch(() => this.geocodeCache.delete(key));
+    if (this.geocodeCache.size > GEOCODE_CACHE_MAX_ENTRIES) {
+      // Map preserves insertion order, so the first key is the oldest entry.
+      this.geocodeCache.delete(this.geocodeCache.keys().next().value as string);
+    }
+    return value;
   }
 
   /** Geocode an address or place name via Nominatim. */
   async geocode(query: string, limit = 5): Promise<Array<Record<string, any>>> {
-    const url = new URL(`${this.nominatimUrl}/search`);
-    url.searchParams.set("q", query);
-    url.searchParams.set("format", "json");
-    url.searchParams.set("limit", String(limit));
-    const response = await this.request(url, `Failed to geocode '${query}'`);
-    return (await response.json()) as Array<Record<string, any>>;
+    return this.cachedNominatim(`search|${limit}|${query}`, async () => {
+      const url = new URL(`${this.nominatimUrl}/search`);
+      url.searchParams.set("q", query);
+      url.searchParams.set("format", "json");
+      url.searchParams.set("limit", String(limit));
+      const response = await this.request(url, `Failed to geocode '${query}'`);
+      return (await response.json()) as Array<Record<string, any>>;
+    });
   }
 
   /** Reverse geocode coordinates to an address via Nominatim. */
   async reverseGeocode(lat: number, lon: number): Promise<Record<string, any>> {
-    const url = new URL(`${this.nominatimUrl}/reverse`);
-    url.searchParams.set("lat", String(lat));
-    url.searchParams.set("lon", String(lon));
-    url.searchParams.set("format", "json");
-    const response = await this.request(url, `Failed to reverse geocode (${lat}, ${lon})`);
-    return (await response.json()) as Record<string, any>;
+    return this.cachedNominatim(`reverse|${lat}|${lon}`, async () => {
+      const url = new URL(`${this.nominatimUrl}/reverse`);
+      url.searchParams.set("lat", String(lat));
+      url.searchParams.set("lon", String(lon));
+      url.searchParams.set("format", "json");
+      const response = await this.request(url, `Failed to reverse geocode (${lat}, ${lon})`);
+      return (await response.json()) as Record<string, any>;
+    });
   }
 
   /** Get routing information between two points via OSRM. */

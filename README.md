@@ -161,8 +161,21 @@ All configuration is optional and done through environment variables:
 | `OSM_TILE_URL` | `https://tile.openstreetmap.org/{z}/{x}/{y}.png` | Tile server for the `standard` style |
 | `THUNDERFOREST_API_KEY` | — | Required for the `transport`, `cycle`, `landscape` and `outdoor` map styles ([free tier](https://www.thunderforest.com/pricing/)) |
 | `OSM_USER_AGENT` | `myosm-mcp-server/1.0 (…)` | User-Agent sent to the OSM services |
+| `NOMINATIM_MIN_INTERVAL_MS` | `1100` on the public Nominatim, `0` on a custom `NOMINATIM_URL` | Minimum spacing between two geocoding requests (`0` disables the queue) |
+| `OSM_MAX_RETRIES` | `3` | Retries on 429/502/503/504, with back-off honoring `Retry-After` (`0` disables) |
+| `GEOCODE_CACHE_TTL_MS` | `86400000` (24 h) | Lifetime of a cached geocoding answer (`0` disables the cache) |
 
 Behind a corporate proxy, run Node with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.15) so `fetch` honors `HTTPS_PROXY`.
+
+### Staying inside the Nominatim rate limit
+
+An LLM asked to locate a dozen places emits a dozen `geocode_address` calls in one turn, and
+MCP clients run them back to back — which is exactly what the public Nominatim answers with
+`429 Too Many Requests`. The client therefore **serializes** geocoding requests with at least
+`NOMINATIM_MIN_INTERVAL_MS` between two of them, **retries** a 429 with back-off, and **caches**
+answers (concurrent lookups of the same place share a single request). Geocoding many places is
+correspondingly slower — roughly one second each — which is the price of the free service; point
+`NOMINATIM_URL` at a self-hosted instance and the spacing defaults to zero.
 
 > **Fair use**: by default the server talks to free, community-run services. Respect the
 > [Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/) (max 1 req/s),
