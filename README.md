@@ -15,9 +15,19 @@ The server gives LLMs tools to interact with OpenStreetMap data:
 - Suggest optimal meeting points for multiple people
 - Explore areas and run neighborhood livability analysis
 - Find schools, EV charging stations and parking facilities
-- **Map layers**: fetch rendered map tiles (standard, transport, cycle, …) as images
-- **Public transport layer**: stops, stations and transit route lines (bus, tram, train, subway, light rail, ferry)
-- **Energy layer**: power lines, underground cables, substations and transformers (with voltage filtering), plus electricity production facilities (power plants and generators, filterable by source and output)
+- **Map layers**: fetch rendered map tiles (standard, transport, cycle, …) as images, and render composed, annotated map images (markers + routes/lines drawn on top)
+- **Public transport layer**: stops, stations and transit route lines (bus, tram, train, subway, light rail, ferry), plus full network topology — lines with ordered stations, interchanges and connections
+- **Energy layer**: power lines, underground cables, substations and transformers (with voltage filtering), electricity production facilities (power plants and generators, filterable by source and output), full power-line tracing and territorial grid summaries
+- **Trip tooling**: travel time/distance matrices (N×M) and POI search along a route corridor
+
+### Agent ergonomics
+
+- **Locations as text everywhere**: every point-based tool accepts either coordinates or a
+  `location` string (place name/address), geocoded automatically — no need to chain
+  `geocode_address` first. Route-style tools take `from_location`/`to_location`
+  (or `home_location`/`work_location`), and `search_category` accepts a named `area`.
+- **Compact responses by default**: Overpass-based tools omit raw OSM tags unless
+  `verbose: true` is passed, keeping token usage low in agent loops.
 
 ## Installation
 
@@ -125,13 +135,17 @@ CLI options: `--http`, `--stdio`, `--host <address>`, `--port <number>`, `--help
 | --- | --- |
 | `get_route_directions` | Route between two points (car/bike/foot) with turn-by-turn directions |
 | `analyze_commute` | Compare home→work commute across several transport modes |
+| `get_travel_time_matrix` | N×M duration/distance matrix between origins and destinations (OSRM `/table`), with best destination per origin |
+| `search_along_route` | POIs within a corridor around a route (fuel, charging, restaurants, …), ordered by position along the route with detour distance |
 
 ### Map layers & transport
 
 | Tool | Description |
 | --- | --- |
-| `get_map_tile` | Rendered map tile (PNG image) covering a location — styles: `standard`, `transport`, `cycle`, `landscape`, `outdoor` |
+| `render_map` | Composed, annotated map image (PNG): stitched tiles + numbered markers + colored paths — pass a route geometry or a power-line trace directly |
+| `get_map_tile` | Single rendered map tile (PNG image) covering a location — styles: `standard`, `transport`, `cycle`, `landscape`, `outdoor` |
 | `find_public_transport` | Public transport layer: stops/stations/terminals plus transit route lines (`bus`, `trolleybus`, `tram`, `train`, `subway`, `light_rail`, `ferry`), filterable by mode |
+| `get_transit_network` | Network topology of an area: lines with ordered station sequences (route relations + route_master grouping), stations with the lines serving them, interchanges, and per-line adjacent-station segments (graph edges) |
 
 ### Energy
 
@@ -139,6 +153,8 @@ CLI options: `--http`, `--stdio`, `--host <address>`, `--port <number>`, `--help
 | --- | --- |
 | `find_power_infrastructure` | Electricity grid: power lines, underground cables, substations, transformers (and on request towers, poles, switches, …) with voltage parsing, `min_voltage` filter and optional line geometry |
 | `find_power_plants` | Production facilities: `power=plant` and `power=generator` with energy source (solar, wind, hydro, nuclear, gas, …), method and output in MW; filterable by `sources` and `min_output_mw` |
+| `trace_power_line` | Reconstruct a full power line from one of its way IDs (route=power relation or tag-compatible connectivity): segments, total length, terminals with nearby substations, GeoJSON MultiLineString |
+| `get_grid_summary` | Territorial grid statistics: km of lines by voltage class and type, substation/transformer/tower counts, production capacity by source |
 
 ## Resources
 
@@ -203,7 +219,8 @@ tile server, so they work without network access.
 
 Same 12 tools and 2 resources, plus:
 
-- 4 new tools: `get_map_tile`, `find_public_transport`, `find_power_infrastructure`, `find_power_plants`
+- 10 new tools: `get_map_tile`, `render_map`, `find_public_transport`, `get_transit_network`, `find_power_infrastructure`, `find_power_plants`, `trace_power_line`, `get_grid_summary`, `get_travel_time_matrix`, `search_along_route`
+- Locations accepted as free text everywhere (automatic geocoding) and compact responses by default (`verbose: true` for raw OSM tags)
 - Streamable HTTP transport (`--http`) in addition to stdio, with per-client sessions and a `/health` endpoint
 - Overpass queries use `out center`, so ways/relations (building-mapped schools, parking lots, …) return usable coordinates instead of being dropped
 - `search_category` subcategory filtering uses a valid Overpass regex filter (the original generated invalid QL)

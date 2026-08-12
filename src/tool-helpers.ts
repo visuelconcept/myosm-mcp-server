@@ -49,3 +49,45 @@ export function addressFromTags(tags: Record<string, string>) {
     postcode: tags["addr:postcode"] ?? "",
   };
 }
+
+/**
+ * Shared `verbose` parameter: raw OSM tags are omitted by default to keep
+ * responses token-efficient for agents; verbose: true restores them.
+ */
+export const verboseParam = () =>
+  z
+    .boolean()
+    .default(false)
+    .describe("Include the raw OSM tags of each result (larger response). Default: compact results.");
+
+/** Tags payload gated by the verbose flag (undefined keys are dropped from JSON). */
+export function tagsOut(
+  tags: Record<string, string>,
+  verbose: boolean,
+): Record<string, string> | undefined {
+  return verbose ? tags : undefined;
+}
+
+/**
+ * Distance (meters) from a point to a [a, b] segment using a local
+ * equirectangular projection — accurate at the sub-kilometer scales used for
+ * corridor searches. Also returns the projection parameter t in [0, 1].
+ */
+export function pointToSegmentMeters(
+  p: Coordinates,
+  a: Coordinates,
+  b: Coordinates,
+): { distance: number; t: number } {
+  const metersPerDegLat = 111_000;
+  const metersPerDegLon =
+    111_000 * Math.cos((((a.latitude + b.latitude) / 2) * Math.PI) / 180);
+  const bx = (b.longitude - a.longitude) * metersPerDegLon;
+  const by = (b.latitude - a.latitude) * metersPerDegLat;
+  const px = (p.longitude - a.longitude) * metersPerDegLon;
+  const py = (p.latitude - a.latitude) * metersPerDegLat;
+  const lengthSquared = bx * bx + by * by;
+  const t = lengthSquared === 0 ? 0 : Math.min(1, Math.max(0, (px * bx + py * by) / lengthSquared));
+  const dx = px - t * bx;
+  const dy = py - t * by;
+  return { distance: Math.hypot(dx, dy), t };
+}

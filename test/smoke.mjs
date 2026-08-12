@@ -26,6 +26,12 @@ const EXPECTED_TOOLS = [
   "find_public_transport",
   "find_power_infrastructure",
   "find_power_plants",
+  "get_travel_time_matrix",
+  "search_along_route",
+  "render_map",
+  "trace_power_line",
+  "get_grid_summary",
+  "get_transit_network",
 ];
 
 const EXPECTED_TEMPLATES = [

@@ -21,7 +21,7 @@ export interface BoundingBox {
 }
 
 export interface OverpassElement {
-  type: "node" | "way" | "relation";
+  type: "node" | "way" | "relation" | "count";
   id: number;
   lat?: number;
   lon?: number;
@@ -30,6 +30,10 @@ export interface OverpassElement {
   geometry?: Array<{ lat: number; lon: number }>;
   /** Present on ways/relations when the query uses `out geom`. */
   bounds?: { minlat: number; minlon: number; maxlat: number; maxlon: number };
+  /** Node ids of a way (body verbosity). */
+  nodes?: number[];
+  /** Members of a relation (body verbosity), in mapped order. */
+  members?: Array<{ type: "node" | "way" | "relation"; ref: number; role: string }>;
   tags?: Record<string, string>;
 }
 
@@ -435,7 +439,7 @@ out center;`;
     bbox: BoundingBox,
     filters: TagFilter[],
     errorMessage: string,
-    options: { out?: "center" | "geom" } = {},
+    options: { out?: "center" | "geom" | "count" } = {},
   ): Promise<OverpassElement[]> {
     const b = overpassBbox(bbox);
     const selectors: string[] = [];
@@ -458,6 +462,101 @@ out center;`;
     const values = routeTypes.map(sanitizeTagPart).join("|");
     const query = `[out:json];\nrelation["type"="route"]["route"~"^(${values})$"](${overpassBbox(bbox)});\nout center;`;
     return this.overpass(query, "Failed to find public transport routes");
+  }
+
+  /**
+   * Fetch everything needed to reconstruct the transit network of an area in
+   * one query: the route relations WITH their ordered members, all their
+   * member nodes (stop positions/platforms with names and coordinates), and
+   * the route_master relations grouping directional variants into lines.
+   */
+  async getTransitNetworkElements(
+    bbox: BoundingBox,
+    routeTypes: string[],
+  ): Promise<OverpassElement[]> {
+    const values = routeTypes.map(sanitizeTagPart).join("|");
+    const query = `[out:json];
+relation["type"="route"]["route"~"^(${values})$"](${overpassBbox(bbox)})->.rts;
+.rts out body;
+node(r.rts);
+out body;
+relation(br.rts)["type"="route_master"];
+out body;`;
+    return this.overpass(query, "Failed to fetch the transit network");
+  }
+
+  /**
+   * Find elements matching a tag filter within `radiusMeters` of a polyline
+   * (Overpass `around` linestring filter). Used for along-route searches.
+   */
+  async findAlongLine(
+    points: Coordinates[],
+    key: string,
+    values: string[] | undefined,
+    radiusMeters: number,
+    errorMessage: string,
+  ): Promise<OverpassElement[]> {
+    const flat = points.map((p) => `${p.latitude},${p.longitude}`).join(",");
+    const selector = tagSelector(key, undefined, values);
+    const query = `[out:json];\nnwr${selector}(around:${Math.round(radiusMeters)},${flat});\nout center;`;
+    return this.overpass(query, errorMessage);
+  }
+
+  /** Compute an OSRM duration/distance matrix between coordinate sets. */
+  async getTravelTimeMatrix(
+    coordinates: Coordinates[],
+    sourceIndexes: number[],
+    destinationIndexes: number[],
+    mode = "car",
+  ): Promise<Record<string, any>> {
+    const profile = OSRM_PROFILES[mode] ?? mode;
+    const coords = coordinates.map((c) => `${c.longitude},${c.latitude}`).join(";");
+    const url = new URL(`${this.osrmUrl}/table/v1/${profile}/${coords}`);
+    url.searchParams.set("sources", sourceIndexes.join(";"));
+    url.searchParams.set("destinations", destinationIndexes.join(";"));
+    url.searchParams.set("annotations", "duration,distance");
+    const response = await this.request(url, "Failed to compute travel time matrix");
+    return (await response.json()) as Record<string, any>;
+  }
+
+  /** Fetch a single way with tags, node ids and geometry. */
+  async getWayWithGeometry(wayId: number): Promise<OverpassElement | undefined> {
+    const elements = await this.overpass(
+      `[out:json];\nway(${Math.trunc(wayId)});\nout geom;`,
+      `Failed to fetch way ${wayId}`,
+    );
+    return elements.find((element) => element.type === "way");
+  }
+
+  /** Find route=power relations that a way belongs to. */
+  async getPowerRouteRelations(wayId: number): Promise<OverpassElement[]> {
+    const query = `[out:json];\nway(${Math.trunc(wayId)});\nrel(bw)["route"="power"];\nout body;`;
+    return this.overpass(query, `Failed to fetch power relations of way ${wayId}`);
+  }
+
+  /** Fetch all power ways that are members of a relation, with geometry. */
+  async getRelationPowerWays(relationId: number): Promise<OverpassElement[]> {
+    const query = `[out:json];\nrel(${Math.trunc(relationId)});\nway(r)["power"];\nout geom;`;
+    return this.overpass(query, `Failed to fetch ways of relation ${relationId}`);
+  }
+
+  /** Fetch power line ways connected to any of the given nodes. */
+  async getConnectedPowerWays(nodeIds: number[]): Promise<OverpassElement[]> {
+    const ids = nodeIds.map((id) => Math.trunc(id)).join(",");
+    const query = `[out:json];\nnode(id:${ids});\nway(bn)["power"~"^(line|minor_line|cable)$"];\nout geom;`;
+    return this.overpass(query, "Failed to fetch connected power ways");
+  }
+
+  /** Find substations within `radiusMeters` of any of the given points. */
+  async findSubstationsAround(
+    points: Coordinates[],
+    radiusMeters = 300,
+  ): Promise<OverpassElement[]> {
+    const selectors = points
+      .map((p) => `nwr["power"="substation"](around:${Math.round(radiusMeters)},${p.latitude},${p.longitude});`)
+      .join("\n  ");
+    const query = `[out:json];\n(\n  ${selectors}\n);\nout center;`;
+    return this.overpass(query, "Failed to find substations near line endpoints");
   }
 
   /** Download a map tile for one of the supported styles. */
