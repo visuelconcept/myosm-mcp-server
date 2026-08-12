@@ -79,7 +79,7 @@ try {
   assert(typeof transport.sessionId === "string", "initialize opens a session (Mcp-Session-Id)");
 
   const { tools } = await client.listTools();
-  assert(tools.length === 16, `tools/list over HTTP returns 16 tools (got ${tools.length})`);
+  assert(tools.length === 22, `tools/list over HTTP returns 22 tools (got ${tools.length})`);
 
   const result = await client.callTool({
     name: "geocode_address",
